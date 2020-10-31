@@ -22,6 +22,9 @@
 #define INTERRUPT_BASED_LED
 #define TASK1_PRIO 2
 #define TASK2_PRIO TASK1_PRIO
+#define NOTIFY_BASED_ACTIVATION
+//#define NOTIFY_BY_POLLING
+#define NOTIFY_FROM_ISR
 
 #define FALSE 0
 #define TRUE 1
@@ -32,14 +35,24 @@ TaskHandle_t task2_Handle;
 TaskHandle_t taskLED_Handle;
 TaskHandle_t taskBUTTON_Handle;
 
-void task1_Handler(void* params);
-void task2_Handler(void* params);
+#ifdef ALLOW_TASK1_AND_TASK2
+void task1Handler(void* params);
+void task2Handler(void* params);
+#endif
 
-void task_Button(void* params);
-void task_LED(void* params);
+#ifdef NOTIFY_BY_POLLING
+void taskButtonNotifyType(void* params);
+#endif
 
-
+#ifndef NOTIFY_BASED_ACTIVATION
 uint8_t button_status_flag = FALSE;
+void taskButton(void* params);
+#endif
+
+void taskLed(void* params);
+void rtosDelay(uint32_t delay_in_ms);
+
+
 
 
 #ifdef ENABLE_SEMIHOSTING
@@ -64,19 +77,49 @@ int main(void)
 
 	printMsg("Hello!!!! Yes Works\n\r");
 
-	//xTaskCreate(task1_Handler, "Task-1", configMINIMAL_STACK_SIZE, NULL, TASK1_PRIO, &task1_Handle);
-	//xTaskCreate(task2_Handler, "Task-2", configMINIMAL_STACK_SIZE, NULL, TASK2_PRIO, &task2_Handle);
+#ifdef ALLOW_TASK1_AND_TASK2
+	xTaskCreate(task1_Handler, "Task-1", configMINIMAL_STACK_SIZE, NULL, TASK1_PRIO, &task1_Handle);
+	xTaskCreate(task2_Handler, "Task-2", configMINIMAL_STACK_SIZE, NULL, TASK2_PRIO, &task2_Handle);
+#endif
 
-	xTaskCreate(task_LED, "LED-TASK", configMINIMAL_STACK_SIZE, NULL, TASK1_PRIO, &taskLED_Handle);
+	xTaskCreate(taskLed, "LED-TASK", 500, NULL, TASK1_PRIO, &taskLED_Handle);
+
+#ifdef TOGGLE_BY_POLLING // default: button signal via interrupt
 	xTaskCreate(task_Button, "BUTTON-TASK", configMINIMAL_STACK_SIZE, NULL, TASK1_PRIO, &taskBUTTON_Handle);
+#elif defined(NOTIFY_BY_POLLING)
+	xTaskCreate(taskButtonNotifyType, "BUTTON-TASK", 500, NULL, TASK1_PRIO, &taskBUTTON_Handle);
+#endif
 
 	vTaskStartScheduler();
 
 	for(;;);
 }
 
+#ifdef NOTIFY_BY_POLLING
+void taskButtonNotifyType(void* params) {
+	while(1) {
 
-void task_Button(void* params) {
+		if(GPIO_ReadInputDataBit(GPIOC,GPIO_Pin_13) == 0) {
+			rtosDelay(500);
+			xTaskNotify(taskLED_Handle, 0x00, eIncrement);
+		}
+	}
+
+}
+#endif
+
+#ifdef NOTIFY_FROM_ISR
+void buttonInterruptHandler() {
+#ifndef NOTIFY_FROM_ISR
+	button_status_flag ^= 0x01;
+#endif
+	BaseType_t prioWokenTask;
+	xTaskNotifyFromISR(taskLED_Handle, 0x00, eIncrement, &prioWokenTask);
+}
+#endif
+
+#ifdef TOGGLE_BY_POLLING
+void taskButton(void* params) {
 	while(1) {
 
 		uint8_t buttonValue = GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_13);
@@ -93,23 +136,36 @@ void task_Button(void* params) {
 		vTaskDelay(10);
 	}
 }
+#endif
 
-void task_LED(void* params) {
+void taskLed(void* params) {
 	while(1) {
-
+#ifndef NOTIFY_BASED_ACTIVATION
 		if(button_status_flag == TRUE) {
 			GPIO_WriteBit(GPIOA, GPIO_Pin_5, Bit_SET);
 			printMsg("LED Task: LED ON \r\n");
 		} else {
 			GPIO_WriteBit(GPIOA, GPIO_Pin_5, Bit_RESET);
-			//printMsg("LED Task: LED OFF \r\n");
+			printMsg("LED Task: LED OFF \r\n");
 		}
 		vTaskDelay(100);
+#else
+	if(GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_5)) {
+		printMsg("Led is currently ON... \r\n");
+	} else {
+		printMsg("Led is currently OFF... \r\n");
 	}
+	if (xTaskNotifyWait(0x01, 0x01, NULL, portMAX_DELAY) == pdTRUE) {
+		printMsg("TaskNotify received...\r\n");
+		GPIO_ToggleBits(GPIOA, GPIO_Pin_5);
+	}
+#endif
+	}
+
 }
 
-
-void task1_Handler(void* params) {
+#ifdef ALLOW_TASK1_AND_TASK2
+void task1Handler(void* params) {
 	while(1) {
 		//printf("From task1\n");
 		printMsg("Message from Task1 \n\r");
@@ -117,14 +173,14 @@ void task1_Handler(void* params) {
 	}
 }
 
-void task2_Handler(void* params) {
+void task2Handler(void* params) {
 	while(1) {
 		//printf("From task2\n");
 		printMsg("Message from Task2 \n\r");
 		vTaskDelay(10);
 	}
 }
-
+#endif
 void prvSetupHardware() {
 	prvSetupUART();
 	prvSetupButton();
@@ -182,6 +238,7 @@ void prvSetupButton() {
 	GPIO_InitTypeDef gpio_button_pins;
 
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC, ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG, ENABLE);
 
 	gpio_button_pins.GPIO_Mode = GPIO_Mode_IN;
 	gpio_button_pins.GPIO_OType = GPIO_OType_PP;
@@ -190,7 +247,25 @@ void prvSetupButton() {
 	gpio_button_pins.GPIO_Speed = GPIO_Low_Speed;
 
 	GPIO_Init(GPIOC, &gpio_button_pins);
+#ifdef NOTIFY_FROM_ISR
+	// interrupt setup
+	//1. Config system to connect EXT13 to PC13 --> SYSCFG
+	SYSCFG_EXTILineConfig(EXTI_PortSourceGPIOC, EXTI_PinSource13);
 
+	//2. Setup/config the EXTI block
+	EXTI_InitTypeDef extiInit;
+
+	extiInit.EXTI_Line = EXTI_Line13;
+	extiInit.EXTI_LineCmd = ENABLE;
+	extiInit.EXTI_Mode = EXTI_Mode_Interrupt;
+	extiInit.EXTI_Trigger = EXTI_Trigger_Falling;
+
+	EXTI_Init(&extiInit);
+
+	//3. NVIC setup
+	NVIC_SetPriority(EXTI15_10_IRQn, 5);
+	NVIC_EnableIRQ(EXTI15_10_IRQn);
+#endif
 }
 
 void prvSetupLed() {
@@ -206,4 +281,21 @@ void prvSetupLed() {
 
 	GPIO_Init(GPIOA, &gpio_led_pins);
 
+}
+
+#ifdef NOTIFY_FROM_ISR
+void EXTI15_10_IRQHandler(void) {
+	//1. CLear interrupt
+	EXTI_ClearITPendingBit(EXTI_Line13);
+
+	//2.
+	//rtosDelay(500);
+	buttonInterruptHandler();
+}
+#endif
+
+void rtosDelay(uint32_t delay_in_ms) {
+	uint32_t currentTickCount = xTaskGetTickCount();
+
+	while(xTaskGetTickCount() < (currentTickCount + pdMS_TO_TICKS(delay_in_ms)));
 }
